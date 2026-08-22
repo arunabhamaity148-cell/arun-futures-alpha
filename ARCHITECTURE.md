@@ -1,97 +1,118 @@
-# ARCHITECTURE — ARUN CoinDCX Futures Signal Bot
+# ARUN Architecture
 
-## Pipeline
+## Top-level flow
 
-```
-EXTERNAL SIGNAL
-  → SOURCE QUALITY
-  → COINDCX CORRELATION
-  → LEAD/LAG
-  → COINDCX MISMATCH
-  → COINDCX PRICE CONFIRMATION
-  → SPREAD/LIQUIDITY
-  → RISK/VETO
-  → SIGNAL
-```
-
-Each layer can reject the signal → NO TRADE. Every rejection is audited.
-
-## Module Layout
-
-```
-trader_arun/
-├── core/           # config, logger, types, rolling stats, circuit breaker, ring buffers
-├── data/           # providers + DataManager + Mismatch + LeadLag
-├── microstructure/ # CVD, OBI, absorption, trade clusters, price impact
-├── derivatives/    # funding, OI, liquidations, basis
-├── alpha/          # S1-S5 strategies + AlphaEngine
-├── regime/         # transparent rule-based classifier
-├── institutional/  # composite footprint proxy score
-├── vetoes/         # V1-V5
-├── risk/           # RISK_SCORE gate, position sizer, SL/TP builder
-├── portfolio/      # crowding (BTC/ETH beta, correlations, PCA)
-├── newsguard/      # free-source news → ALLOW/REDUCE/BLOCK
-├── signals/        # generator, Telegram publisher, audit
-├── ops/            # storage, safety, operator, health, shutdown
-└── backtest/       # walk-forward + DSR
+```text
+CoinDCX / Binance / Hyperliquid / Bybit / Kraken
+                ↓
+         Normalized provider layer
+                ↓
+            PairSnapshot
+                ↓
+  Feature / analyser state construction
+                ↓
+Mismatch → Regime → Alpha → News → Footprint → Veto → Risk → Sizing → SL/TP
+                ↓
+        Audited Telegram signal
 ```
 
-## Threading / Concurrency Model
+## Critical design constraints
 
-- Single asyncio event loop.
-- All providers share one `aiohttp.ClientSession`.
-- All blocking writes off-loaded via `asyncio.to_thread`.
-- All buffers bounded via `collections.deque(maxlen=N)`.
-- All rolling stats incremental O(1) per update.
-- No raw tick spam — engine evaluates decisions at `decision_interval_sec` (default 30s).
+- ARUN is **signal-only**. It never places orders.
+- CoinDCX is the **execution-truth venue**.
+- External venues are **reference-only** and remain explicitly separated from CoinDCX fields.
+- If critical CoinDCX fields fail validation, the system must produce **NO TRADE**.
 
-## Fail-Closed Principles
+## Provider layer
 
-1. If CoinDCX futures symbol is NOT VERIFIED → NO TRADE.
-2. If any required data feed is stale/missing → NO TRADE.
-3. If CoinDCX mismatch score ≥ 60 → NO TRADE.
-4. If any HARD veto (V1-V5) is triggered → NO TRADE.
-5. If RISK_SCORE ≥ 75 → NO TRADE.
-6. If news state is BLOCK → NO TRADE.
-7. If daily-loss kill switch is active → NO TRADE.
-8. If consecutive-loss latch is active → NO TRADE.
-9. If manual pause is active → NO TRADE.
-10. If news provider is unavailable → BLOCK (fail-safe).
+### `trader_arun.data.base.Provider`
 
-## Persistence
+Implements:
+- async HTTP only
+- request timeout
+- connection timeout
+- token-bucket rate limiting
+- circuit breaker
+- bounded latency history
+- health reporting
+- fail-closed exceptions
 
-- SQLite with WAL mode.
-- Bounded retention (last 100k rows per table).
-- Atomic writes via single-writer queue.
-- Corruption-tolerant startup (if DB init fails, continues in-memory).
-- Operator state and safety latches persist across restarts.
+### `trader_arun.data.coindcx.CoinDCXProvider`
 
-## Health Monitoring
+Responsibilities:
+- parse CoinDCX tickers into canonical `Ticker`
+- parse orderbooks with list-or-dict schema support
+- fetch candles
+- discover futures instruments for exact symbol verification
 
-- RSS memory (warning 350 MB, critical 600 MB).
-- Event-loop lag (warning 0.5s, critical 2.0s).
-- Queue HWM (warning 5000).
-- Per-provider latency p95, failures, state.
-- Signal/veto counts.
+### `trader_arun.data.manager.DataManager`
 
-## Operator Commands (Telegram)
+Responsibilities:
+- own providers
+- fetch pair snapshots with bounded concurrency
+- isolate provider failures per request
+- validate ticker freshness and basic integrity
+- expose provider health
+- enforce CoinDCX-vs-reference separation
 
-```
-/status    — overall status
-/paused    — show pause state
-/pause     — pause new signals
-/resume    — resume new signals
-/mute      — mute signal output
-/unmute    — unmute signal output
-/reset     — reset all safety latches
-/health    — provider health snapshot
-/signals   — recent 5 signals
-/risk      — risk gate state
-```
+## Snapshot model
 
-## Shutdown
+`PairSnapshot` carries per-field data without collapsing venue identity:
+- `coindcx_ticker`, `coindcx_book`, `coindcx_candles`
+- `external_tickers`, `external_books`
+- `binance_candles`, `hl_candles`
+- `funding`, `open_interest`
+- `liquidations`, `trades_by_venue`
+- `metadata`
 
-- SIGINT/SIGTERM handled.
-- All shutdown hooks called in reverse order.
-- Each hook has 10s timeout — cannot block shutdown.
-- No post-shutdown reconnects (providers closed cleanly).
+## Mismatch engine
+
+`trader_arun.data.mismatch.MismatchEngine` scores:
+- price deviation
+- bid deviation
+- ask deviation
+- spread deviation
+- return divergence
+- volatility divergence
+- liquidity divergence
+- timestamp skew
+- contract verification penalty
+- missing-data penalty
+
+Bands:
+- `NORMAL`
+- `WATCH`
+- `REDUCE`
+- `NO_TRADE`
+
+## Signal path
+
+1. verify CoinDCX futures universe status
+2. build analyser state from normalized snapshot
+3. compute cross-exchange mismatch
+4. classify regime
+5. evaluate alpha stack `S1..S5`
+6. apply NewsGuard state
+7. compute institutional footprint
+8. apply deterministic veto engine `V1..V5`
+9. compute risk
+10. size position suggestion
+11. build SL/TP and output auditable signal
+
+## Failure model
+
+- one provider failure must not crash the decision loop
+- one pair timeout must not block the rest of the watchlist
+- missing CoinDCX critical data must fail closed
+- optional reference data may enrich context but never silently replace CoinDCX execution truth
+
+## Bounded-state controls
+
+- provider latency histories are bounded
+- trade-history stores are bounded deques
+- warning aggregation state is bounded by provider/pair keys
+- circuit-breaker failure windows are bounded
+
+## Live verification status
+
+Architecture is code-complete and test-covered, but live verification remains environment-limited because exact CoinDCX futures-universe confirmation did not succeed and Binance futures was geo-restricted in this environment.
