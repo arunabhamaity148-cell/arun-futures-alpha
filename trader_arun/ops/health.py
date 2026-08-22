@@ -1,9 +1,8 @@
-"""Health monitor — RSS, CPU, event-loop lag, queue HWM, tasks, cache size."""
+"""Health monitor â€” RSS, CPU, event-loop lag, queue HWM, tasks, cache size."""
 from __future__ import annotations
 
 import asyncio
 import os
-import resource
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,13 +56,68 @@ class HealthMonitor:
         return lag
 
     def get_rss_mb(self) -> float:
+        """Return current process RSS in MB on Windows/Linux/macOS."""
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                    _fields_ = [
+                        ("cb", wintypes.DWORD),
+                        ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t),
+                    ]
+
+                counters = PROCESS_MEMORY_COUNTERS()
+                counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+
+                psapi = ctypes.WinDLL("psapi.dll")
+                kernel32 = ctypes.WinDLL("kernel32.dll")
+
+                get_current_process = kernel32.GetCurrentProcess
+                get_current_process.restype = wintypes.HANDLE
+
+                get_memory_info = psapi.GetProcessMemoryInfo
+                get_memory_info.argtypes = [
+                    wintypes.HANDLE,
+                    ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+                    wintypes.DWORD,
+                ]
+                get_memory_info.restype = wintypes.BOOL
+
+                process = get_current_process()
+
+                if get_memory_info(
+                    process,
+                    ctypes.byref(counters),
+                    counters.cb,
+                ):
+                    return float(counters.WorkingSetSize) / (1024.0 * 1024.0)
+
+            except (ImportError, AttributeError, OSError, ValueError, TypeError):
+                pass
+
+            return 0.0
+
         try:
+            import resource
+
             usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            # On Linux ru_maxrss is in KB; on macOS it's in bytes.
-            if usage > 10_000_000:  # heuristic: bytes
-                return usage / 1024 / 1024
-            return usage / 1024
-        except (AttributeError, OSError):
+
+            if sys.platform == "darwin":
+                return float(usage) / (1024.0 * 1024.0)
+
+            return float(usage) / 1024.0
+
+        except (ImportError, AttributeError, OSError, ValueError):
             return 0.0
 
     def snapshot(
